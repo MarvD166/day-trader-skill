@@ -60,7 +60,11 @@ prediction: earnings, news and halts can do what the last 60 days never did.
 Data: https://query2.finance.yahoo.com/v8/finance/chart/<T>?range=60d&interval=5m
 (unofficial and free, can lag; falls back to query1 on 429 or 5xx).
 --offline FILE reads a saved chart JSON (.json or .json.gz) instead.
-Times are New York (ET) wall-clock; --now "2026-10-19 10:15" pins the clock.
+Times are the market's wall clock (New York, ET, for the default XNYS);
+--now "2026-10-19 10:15" pins the clock. --market (or the plan's "market", or
+trader/config.json) picks the exchange: the session, its bar count (78 on the
+NYSE, 102 on Xetra's 9:00 to 17:30) and early closes follow it. Tradegate is
+replayed on Xetra's bars.
 """
 
 import argparse
@@ -78,12 +82,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import trader_markets as mk  # noqa: E402  copy of shared/trader_markets.py (scripts/sync_shared.py)
+
+MARKET = mk.get()  # XNYS unless --market or trader/config.json "market" says otherwise
+
 UA = "Mozilla/5.0 (compatible; day-trader-skill/2.0; +https://github.com/Jakeschincariol/day-trader-skill)"
 PAUSE = 0.5          # seconds between requests: be polite to free endpoints
 BACKOFF = 5.0        # seconds to wait once after a 429
 HOSTS = ("query2", "query1")
 INTERVAL = 300       # 5-minute bars, in seconds
-SESSION_BARS = 78    # 9:30 to 16:00 in 5-minute bars
+SESSION_BARS = 78    # 9:30 to 16:00 in 5-minute bars on the NYSE; set_market() resets these three
 OPEN_MIN = 9 * 60 + 30
 CLOSE_MIN = 16 * 60
 MIN_SESSIONS = 20
@@ -96,58 +105,49 @@ STRONG = 0.15
 MANY_NEITHER = 0.40
 EPOCH = datetime.datetime(1970, 1, 1)
 WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
-NYSE_EARLY_CLOSE = {  # 1:00 p.m. ET, from https://www.nyse.com/markets/hours-calendars (read 2026-10-13)
-    "2026-11-27": "day after Thanksgiving",
-    "2026-12-24": "Christmas Eve",
-    "2027-11-26": "day after Thanksgiving",
-}
-EARLY_MIN = 13 * 60
-
-
 class TMError(Exception):
     pass
 
 
-# ---------------------------------------------------------------- time (copied from trader-alerts)
+# ---------------------------------------------------------------- market and time
 
-def _nth_sunday(year, month, n):
-    d = datetime.date(year, month, 1)
-    d += datetime.timedelta(days=(6 - d.weekday()) % 7)
-    return d + datetime.timedelta(weeks=n - 1)
-
-
-def eastern_offset(utc):
-    """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
-    DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
-    first Sunday of November (US rule since 2007)."""
-    y = utc.year
-    start = datetime.datetime.combine(_nth_sunday(y, 3, 2), datetime.time(7, 0))   # 2:00 EST
-    end = datetime.datetime.combine(_nth_sunday(y, 11, 1), datetime.time(6, 0))    # 2:00 EDT
-    naive = utc.replace(tzinfo=None)
-    return -4 if start <= naive < end else -5
+def set_market(m):
+    """Switch the exchange this run uses. Tradegate is replayed on Xetra's bars and session."""
+    global MARKET, OPEN_MIN, CLOSE_MIN, SESSION_BARS
+    m = m if isinstance(m, mk.Market) else mk.get(m)
+    MARKET = m.bars_market()
+    OPEN_MIN = MARKET.open.hour * 60 + MARKET.open.minute
+    CLOSE_MIN = MARKET.close.hour * 60 + MARKET.close.minute
+    SESSION_BARS = (CLOSE_MIN - OPEN_MIN) // 5
+    return m
 
 
-def to_eastern(utc):
-    return utc.replace(tzinfo=None) + datetime.timedelta(hours=eastern_offset(utc))
+def utc_offset(utc):
+    return MARKET.offset(utc)
 
 
-def eastern_to_utc(local):
-    for off in (-4, -5):
-        utc = local - datetime.timedelta(hours=off)
-        if eastern_offset(utc) == off:
-            return utc
-    return local + datetime.timedelta(hours=5)
+def to_local(utc):
+    """naive UTC -> naive wall clock at the market."""
+    return MARKET.to_local(utc)
+
+
+def local_to_utc(local):
+    return MARKET.to_utc(local)
+
+
+# the US-only names, kept for older callers
+eastern_offset, to_eastern, eastern_to_utc = utc_offset, to_local, local_to_utc
 
 
 def parse_now(text):
-    """ISO time -> naive UTC. A time without an offset is taken as New York time."""
+    """ISO time -> naive UTC. A time without an offset is taken as market time."""
     if not text:
         return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
     t = text.strip().replace("Z", "+00:00")
     try:
         dt = datetime.datetime.fromisoformat(t)
     except ValueError:
-        raise TMError("--now wants a time like \"2026-10-19 10:15\" (New York) or ...Z (UTC)")
+        raise TMError("--now wants a time like \"2026-10-19 10:15\" (%s) or ...Z (UTC)" % MARKET.city)
     if dt.tzinfo is None:
         return eastern_to_utc(dt)
     return (dt - dt.utcoffset()).replace(tzinfo=None)
@@ -158,10 +158,11 @@ def utc_of(ts):
 
 
 def parse_clock(text, what):
-    """'10:15 AM', '10:15am', '15:55' or '3:55' (a bare 1 to 8 o'clock means p.m.) -> minutes after midnight."""
+    """'10:15 AM', '10:15am', '15:55' or '3:55' -> minutes after midnight. A bare hour before the
+    open's hour means p.m. (1 to 8 o'clock on the NYSE, 1 to 7 on the LSE)."""
     m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*(?:([AaPp])\.?\s*[Mm]\.?)?\s*$", str(text or ""))
     if not m:
-        raise TMError("%s wants a New York time like 10:15 AM or 15:55, not %r" % (what, text))
+        raise TMError("%s wants a %s time like 10:15 AM or 15:55, not %r" % (what, MARKET.city, text))
     h, mi, ap = int(m.group(1)), int(m.group(2)), (m.group(3) or "").lower()
     if mi > 59 or h > 23 or (ap and not 1 <= h <= 12):
         raise TMError("%s %r is not a clock time" % (what, text))
@@ -169,7 +170,7 @@ def parse_clock(text, what):
         h += 12
     elif ap == "a" and h == 12:
         h = 0
-    elif not ap and 1 <= h <= 8:
+    elif not ap and 1 <= h < MARKET.open.hour:
         h += 12
     return h * 60 + mi
 
@@ -187,7 +188,7 @@ def clock24(minutes):
 
 def chart_url(sym, host="query2"):
     return "https://%s.finance.yahoo.com/v8/finance/chart/%s?range=60d&interval=5m" % (
-        host, urllib.parse.quote(sym.upper().replace(".", "-")))
+        host, urllib.parse.quote(MARKET.yahoo(sym)))
 
 
 def _sleep(seconds):
@@ -273,7 +274,7 @@ def parse_bars(result, now_utc):
     oldest first. Dropped: bars with a missing price, bars off the 5-minute grid
     (the live tick, e.g. 10:49:45), bars not complete yet (now < start + 5 min,
     where now is the earlier of --now and the data's own regularMarketTime), and
-    bars outside 9:30 to 16:00 New York time."""
+    bars outside the regular session (9:30 to 16:00 New York time on the NYSE)."""
     meta = result.get("meta") or {}
     stamps = result.get("timestamp") or []
     q = ((result.get("indicators") or {}).get("quote") or [{}])[0] or {}
@@ -294,7 +295,7 @@ def parse_bars(result, now_utc):
             dropped["off_grid"] += 1
             continue
         start = utc_of(ts)
-        local = to_eastern(start)
+        local = to_local(start)
         mins = local.hour * 60 + local.minute - OPEN_MIN
         if mins < 0 or mins >= SESSION_BARS * 5:
             dropped["outside_hours"] += 1
@@ -302,6 +303,8 @@ def parse_bars(result, now_utc):
         if start + datetime.timedelta(seconds=INTERVAL) > as_of:
             dropped["not_complete"] += 1
             continue
+        if MARKET.price_divisor != 1:         # LSE: pence -> pounds
+            o, h, l, c = (MARKET.price(x) for x in (o, h, l, c))
         bars[ts] = {"date": local.date().isoformat(), "slot": mins // 5, "start": local.strftime("%H:%M"),
                     "o": o, "h": h, "l": l, "c": c, "v": v or 0}
     return meta, [bars[t] for t in sorted(bars)], dropped
@@ -316,7 +319,7 @@ def split_sessions(bars):
 
 
 def full_sessions(days, before):
-    """Full sessions (all 78 bars) strictly before the plan's date, oldest first,
+    """Full sessions (all SESSION_BARS bars: 78 on the NYSE) strictly before the plan's date, oldest first,
     and the short ones that were left out (half days, gaps)."""
     full, short = [], []
     for d in sorted(days):
@@ -508,7 +511,7 @@ def load_plan(a, now_utc):
         missing = [f for f in ("entry", "stop", "target", "entry_time") if getattr(a, f) is None]
         if missing:
             raise TMError("with --symbol also give %s" % ", ".join("--" + m.replace("_", "-") for m in missing))
-        raw = {"symbol": a.symbol, "side": a.side, "date": a.date or to_eastern(now_utc).date().isoformat(),
+        raw = {"symbol": a.symbol, "side": a.side, "date": a.date or to_local(now_utc).date().isoformat(),
                "entry": a.entry, "stop": a.stop, "target": a.target, "entry_time": a.entry_time,
                "setup": a.setup, "opening_range": {"minutes": a.or_minutes}, "stop_rule": a.stop_rule,
                "interval": "5m"}
@@ -569,15 +572,15 @@ def normalize_plan(raw, src="flags"):
     if k is None:
         raise TMError("the plan needs entry_time (the entry bar's close, e.g. 10:15 AM) or entry_bar")
     if not 0 <= k <= SESSION_BARS - 2:
-        raise TMError("the entry must close between 9:35 AM and 3:55 PM to leave bars to replay "
-                      "(got %s)" % clock12(OPEN_MIN + 5 * (k + 1)))
+        raise TMError("the entry must close between %s and %s to leave bars to replay "
+                      "(got %s)" % (clock12(OPEN_MIN + 5), clock12(CLOSE_MIN - 5), clock12(OPEN_MIN + 5 * (k + 1))))
     orng = raw.get("opening_range") or {}
     or_min = orng.get("minutes", 15) if isinstance(orng, dict) else 15
     try:
         or_min = int(or_min)
     except (TypeError, ValueError):
         raise TMError("opening_range.minutes must be a number")
-    if or_min < 5 or or_min % 5 or or_min >= 390:
+    if or_min < 5 or or_min % 5 or or_min >= SESSION_BARS * 5:
         raise TMError("opening_range.minutes must be a multiple of 5 (got %s)" % or_min)
     risk = (entry - stop) if long else (stop - entry)
     return {
@@ -624,7 +627,7 @@ def resolve_rule(plan, entry_day):
 # ---------------------------------------------------------------- the run
 
 def _until12(mc):
-    t = mc.get("until") or "16:00"
+    t = mc.get("until") or clock24(CLOSE_MIN)
     return clock12(int(t[:2]) * 60 + int(t[3:]))
 
 
@@ -686,7 +689,7 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     result = chart_result(text, sym)
     meta, bars, dropped = parse_bars(result, now_utc)
     msym = str(meta.get("symbol") or "").upper()
-    if msym and msym != sym.replace(".", "-"):
+    if msym and msym != MARKET.yahoo(sym):
         raise TMError("the data is for %s but the plan is for %s" % (msym, sym))
     gran = meta.get("dataGranularity")
     if gran and gran != "5m":
@@ -694,8 +697,9 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     if not bars:
         raise TMError("no complete 5-minute bars for %s in the data" % sym)
     k = plan["entry_bar"]
-    early = plan["date"] in NYSE_EARLY_CLOSE
-    end_min = EARLY_MIN if early else CLOSE_MIN
+    ec = MARKET.early_close(datetime.date.fromisoformat(plan["date"]))
+    early = ec is not None
+    end_min = (ec[0].hour * 60 + ec[0].minute) if early else CLOSE_MIN
     until_min = end_min if until is None else parse_clock(until, "--until")
     if (until_min - OPEN_MIN) % 5 or until_min > end_min:
         raise TMError("--until must be on the 5-minute grid and no later than %s%s"
@@ -739,8 +743,10 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
         "created_by": "trader-timemachine",
         "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source": source,
+        "market": MARKET.code,
         "data": {"symbol": msym or sym, "interval": "5m", "range": "60d",
-                 "last_bar": "%s %s ET" % (last_bar["date"], last_bar["start"]),
+                 "last_bar": "%s %s %s" % (last_bar["date"], last_bar["start"],
+                                           MARKET.label_on(datetime.date.fromisoformat(last_bar["date"]))),
                  "dropped": dropped, "short_sessions_left_out": short},
         "plan": plan_out,
         "mc": mc,
@@ -917,7 +923,7 @@ def main(argv=None):
         p.add_argument("--plan", default="trader/plan.json", help="the plan from trader-exit")
         p.add_argument("--symbol", help="or give the plan as flags: ticker")
         p.add_argument("--side", default="buy", choices=["buy", "sell"])
-        p.add_argument("--date", help="the plan's day, YYYY-MM-DD (default today, New York)")
+        p.add_argument("--date", help="the plan's day, YYYY-MM-DD (default today, market time)")
         p.add_argument("--entry", type=float)
         p.add_argument("--stop", type=float)
         p.add_argument("--target", type=float)
@@ -928,9 +934,9 @@ def main(argv=None):
         p.add_argument("--replays", type=int, default=10000)
         p.add_argument("--seed", type=int, default=19)
         p.add_argument("--window", type=int, default=2, help="draw from the same time of day +- this many bars")
-        p.add_argument("--until", help="end each replay at this time (default 16:00, the close)")
+        p.add_argument("--until", help="end each replay at this time (default: the close, 16:00 on the NYSE)")
         p.add_argument("--offline", metavar="FILE", help="a saved Yahoo chart JSON (.json or .json.gz), no network")
-        p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" New York, or ISO with Z)')
+        p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" market time, or ISO with Z)')
 
     p = sub.add_parser("run", help="replay the plan: 10,000 simulated sessions plus the history")
     common(p)
@@ -941,13 +947,24 @@ def main(argv=None):
     common(p)
     p.add_argument("--from", dest="from_file", nargs="?", const="trader/timemachine.json", metavar="PATH",
                    help="draw a saved result instead of running again")
+    for p in sub.choices.values():
+        p.add_argument("--market", help="exchange: %s (default: the plan's, else trader/config.json "
+                       "\"market\", else XNYS)" % ", ".join(mk.codes()))
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
         return 1
     try:
+        doc = None
+        if not a.symbol and os.path.exists(a.plan):
+            try:
+                with open(a.plan, encoding="utf-8") as fh:
+                    doc = json.load(fh)
+            except ValueError:
+                doc = None
+        set_market(mk.resolve(a.market, doc=doc))
         return {"run": cmd_run, "chart": cmd_chart}[a.cmd](a)
-    except TMError as e:
+    except (TMError, mk.MarketError) as e:
         print("timemachine.py: %s" % e, file=sys.stderr)
         return 1
 

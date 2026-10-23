@@ -186,6 +186,23 @@ oversold bounce).
 - Never print a P&L, a return or a profit figure.
 - A hit is stale once the price has moved on. Re-run before acting on it.
 
+## Markets
+
+The default is US stocks (XNYS: NYSE and Nasdaq, New York time, dollars).
+Other exchanges: Xetra (XETR), Tradegate (XGAT), London (XLON), Euronext Paris
+and Amsterdam (XPAR, XAMS) and SIX (XSWX). Pick one with `--market XETR`, or
+once for every skill with `"market": "XETR"` in `trader/config.json`
+(`trader-budget/config.example.xetra.json` is a ready Xetra config). The
+market sets the clock, the holidays, the session, the currency and the Yahoo
+suffix (SAP becomes SAP.DE). Plans and orders carry their `"market"`, so the
+next skill follows it. Calendars are rules: a year not checked against the
+exchange's published calendar is flagged, and Euronext and SIX are not
+checked yet.
+
+`scan.py universe` reads Nasdaq Trader's US lists only. Outside the US pass
+`--symbols`, `--watchlist` or `--universe FILE`. Tradegate is scanned on
+Xetra's bars (09:00 to 17:30), because Yahoo has no Tradegate prices.
+
 ## What it never does
 
 It never places, sizes or checks an order, never says which stock to buy,

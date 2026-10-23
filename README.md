@@ -120,6 +120,37 @@ An example, the trade in the reel: Tesla, Monday October 19 2026, real data.
 9. **`/trader-alerts`** rings on the stop, the target and at 3:55 PM to
    flatten whatever is still open.
 
+## Markets outside the US
+
+Every clock-, calendar- and price-aware tool reads one shared market profile
+(`shared/trader_markets.py`, copied into each skill folder so a single skill
+still installs on its own; `python3 scripts/sync_shared.py` refreshes the
+copies and a test fails when one drifts).
+
+| code | exchange | hours (local) | currency | Yahoo | calendar checked |
+| --- | --- | --- | --- | --- | --- |
+| `XNYS` | NYSE and Nasdaq (default) | 9:30 to 16:00 ET | USD | `TSLA` | 2026, 2027 |
+| `XETR` | Xetra | 9:00 to 17:30 CET/CEST | EUR | `SAP.DE` | 2026, 2027 |
+| `XGAT` | Tradegate | 7:30 to 22:00 | EUR | via Xetra | 2026 |
+| `XLON` | London Stock Exchange | 8:00 to 16:30 UK | GBP (Yahoo's pence / 100) | `VOD.L` | 2026, 2027 |
+| `XPAR` / `XAMS` | Euronext Paris / Amsterdam | 9:00 to 17:30 | EUR | `.PA` / `.AS` | not yet |
+| `XSWX` | SIX Swiss Exchange | 9:00 to 17:30 | CHF | `.SW` | not yet |
+
+Pick one per run with `--market XETR`, or for the whole pack with
+`"market": "XETR"` in `trader/config.json` (`trader-budget/config.example.xetra.json`
+is a ready one). Plans and orders record their market, so the next skill
+follows it. Holidays are computed by rule (Easter, nth weekdays, observed
+days), so they do not run out; a year not checked against the exchange's own
+calendar is flagged as such. Defaults follow the session: no entries in the
+first 15 minutes or the last 30, flat 5 minutes before the close.
+
+What changes outside the US: the scanner's `universe` command is US only (pass
+`--symbols` or a list); SEC filings and the PDT guard are off; Yahoo has no
+Tradegate prices, so Tradegate is read through Xetra's bars (9:00 to 17:30);
+and Alpaca lists US stocks only, so an order for another market is never
+READY with `"broker": "alpaca"` (the same ticker there can be a different
+security, like SAP's US ADR).
+
 ## The tools
 
 All standard-library Python. The data tools read public endpoints and are

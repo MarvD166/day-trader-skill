@@ -30,7 +30,11 @@ work around the one moment that matters, your yes:
     python3 ticket.py log
 
 Everything is written to trader/state/broker.json (append only). Dates are
-New York dates; --now "2026-10-19 10:15" pins the clock.
+market dates (New York for the default XNYS); --now "2026-10-19 10:15" pins
+the clock. The market comes from --market, the orders file's "market",
+trader/config.json, else XNYS. An order outside the US is never READY with
+"broker": "alpaca": Alpaca lists US stocks only, and the same ticker there can
+be a different security (SAP on the NYSE is the ADR, in dollars).
 """
 
 import argparse
@@ -40,6 +44,11 @@ import json
 import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import trader_markets as mk  # noqa: E402  copy of shared/trader_markets.py (scripts/sync_shared.py)
+
+MARKET = mk.get()  # XNYS unless --market or trader/config.json "market" says otherwise
 
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
@@ -59,55 +68,70 @@ class TicketError(Exception):
     pass
 
 
-# ---------------------------------------------------------------- time (New York, no tz files)
+# ---------------------------------------------------------------- market and time
 
-def _nth_sunday(year, month, n):
-    d = datetime.date(year, month, 1)
-    d += datetime.timedelta(days=(6 - d.weekday()) % 7)
-    return d + datetime.timedelta(weeks=n - 1)
-
-
-def eastern_offset(utc):
-    """Hours from UTC for New York: -4 in daylight time, -5 otherwise.
-    DST runs from 2:00 a.m. on the second Sunday of March to 2:00 a.m. on the
-    first Sunday of November (US rule since 2007)."""
-    y = utc.year
-    start = datetime.datetime.combine(_nth_sunday(y, 3, 2), datetime.time(7, 0))   # 2:00 EST
-    end = datetime.datetime.combine(_nth_sunday(y, 11, 1), datetime.time(6, 0))    # 2:00 EDT
-    naive = utc.replace(tzinfo=None)
-    return -4 if start <= naive < end else -5
+def set_market(m):
+    """Switch the exchange this run uses (a trader_markets.Market or a code like "XETR")."""
+    global MARKET
+    m = m if isinstance(m, mk.Market) else mk.get(m)
+    MARKET = m
+    return m
 
 
-def to_eastern(utc):
-    return utc.replace(tzinfo=None) + datetime.timedelta(hours=eastern_offset(utc))
+def utc_offset(utc):
+    return MARKET.offset(utc)
 
 
-def eastern_to_utc(local):
-    for off in (-4, -5):
-        utc = local - datetime.timedelta(hours=off)
-        if eastern_offset(utc) == off:
-            return utc
-    return local + datetime.timedelta(hours=5)
+def to_local(utc):
+    """naive UTC -> naive wall clock at the market."""
+    return MARKET.to_local(utc)
+
+
+def local_to_utc(local):
+    return MARKET.to_utc(local)
+
+
+# the US-only names, kept for older callers
+eastern_offset, to_eastern, eastern_to_utc = utc_offset, to_local, local_to_utc
+
+
+BROKER = "alpaca"   # set from trader/config.json "broker" when the orders are loaded
+
+
+def market_block():
+    """Why an order on this market cannot go to this broker, or None. Alpaca lists US stocks only:
+    a Xetra ticker sent there could match a different US listing (SAP the ADR, in dollars)."""
+    if MARKET.code != "XNYS" and BROKER == "alpaca":
+        return ("Alpaca trades US stocks only, and this order is for %s. Set \"broker\": \"ibkr\" in "
+                "trader/config.json, or place it yourself at your broker" % MARKET.name)
+    return None
+
+
+def cur(text):
+    """The words were written with $: swap in the market's currency."""
+    return text if MARKET.cur_symbol == "$" or not isinstance(text, str) else text.replace("$", MARKET.cur_symbol)
 
 
 def parse_now(text):
-    """ISO time -> naive UTC. A time without an offset is taken as New York time."""
+    """ISO time -> naive UTC. A time without an offset is taken as market time."""
     if not text:
         return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
     t = text.strip().replace("Z", "+00:00")
     try:
         dt = datetime.datetime.fromisoformat(t)
     except ValueError:
-        raise TicketError("--now wants a time like \"2026-10-19 10:15\" (New York) or ...Z (UTC)")
+        raise TicketError("--now wants a time like \"2026-10-19 10:15\" (%s) or ...Z (UTC)" % MARKET.city)
     if dt.tzinfo is None:
         return eastern_to_utc(dt)
     return (dt - dt.utcoffset()).replace(tzinfo=None)
 
 
-def ny_iso(now_utc):
-    """naive UTC -> "2026-10-19T10:15:00-04:00" (New York wall clock with its offset)."""
-    off = eastern_offset(now_utc)
-    return "%s%+03d:00" % (to_eastern(now_utc).replace(microsecond=0).isoformat(), off)
+def local_iso(now_utc):
+    """naive UTC -> "2026-10-19T10:15:00-04:00" (market wall clock with its offset)."""
+    return MARKET.iso_local(now_utc)
+
+
+ny_iso = local_iso
 
 
 # ---------------------------------------------------------------- files
@@ -179,7 +203,7 @@ def tool_input(order):
 def _money(v):
     f = float(v)
     s = "{:,.2f}".format(f)
-    return "$" + (s[:-3] if s.endswith(".00") else s)
+    return MARKET.cur_symbol + (s[:-3] if s.endswith(".00") else s)
 
 
 def _p(v):
@@ -327,6 +351,9 @@ def status_of(order, risk, state, today):
     """(ready, label, risk_result)"""
     fp = fingerprint(order)
     rv, why = risk_verdict(risk, fp, today)
+    blocked = market_block()
+    if blocked:
+        return False, "NOT READY: " + blocked, rv
     if rv is None:
         return False, "NOT READY: " + why, None
     if rv.get("verdict") != "PASS":
@@ -376,7 +403,7 @@ def render(order, idx, total, cfg, risk, state, today):
         lines.append("  Reply \"yes\" to place this one order, or \"no\" to skip it.")
         if broker != "ibkr":
             lines.append("  Claude's own card then asks again: Allow once places it, Deny stops it.")
-    return "\n".join(lines), ready
+    return cur("\n".join(lines)), ready
 
 
 def ticket_json(order, idx, cfg, risk, state, today):
@@ -453,7 +480,7 @@ def log_fill(state_path, now, today, symbol, side, qty, price):
 
 def _clock(a):
     now = parse_now(getattr(a, "now", None))
-    today = getattr(a, "today", None) or to_eastern(now).date().isoformat()
+    today = getattr(a, "today", None) or to_local(now).date().isoformat()
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", today):
         raise TicketError("--today wants a date like 2026-10-19")
     return now, today
@@ -465,6 +492,8 @@ def _load(a):
     if not isinstance(orders, list) or not orders:
         raise TicketError("no orders in %s" % a.orders)
     cfg = read_json(a.config, "config", required=False) or {}
+    global BROKER
+    BROKER = str(cfg.get("broker", "alpaca")).lower()
     risk = read_json(a.risk, "risk check", required=False)
     state = load_state(a.state)
     now, today = _clock(a)
@@ -572,7 +601,7 @@ def cmd_result(a):
 def cmd_fill(a):
     cfg = read_json(a.config, "config", required=False) or {}
     now = parse_now(a.now)
-    date = a.date or to_eastern(now).date().isoformat()
+    date = a.date or to_local(now).date().isoformat()
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
         raise TicketError("--date wants a date like 2026-10-19")
     pf = apply_fill(a.portfolio, cfg, a.symbol, a.side, a.qty, a.price, date)
@@ -602,18 +631,18 @@ def cmd_flatten(a):
                               "%s) and pass --qty if you do hold some" % (sym, a.portfolio, sym))
     plan = read_json(a.plan, "plan", required=False) or {}
     flat_by = (plan.get("flat_by") if str(plan.get("symbol", "")).upper() == sym else None) \
-        or cfg.get("flat_by") or "15:55"
+        or cfg.get("flat_by") or MARKET.minutes_before_close(5).strftime("%H:%M")
     order = {"symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "market", "time_in_force": "day",
-             "why": "flat by %s New York: closes the %s day trade before the close (qty from %s)"
-             % (flat_by, sym, source)}
+             "why": "flat by %s %s: closes the %s day trade before the close (qty from %s)"
+             % (flat_by, MARKET.city, sym, source)}
     old = read_json(a.orders, "orders", required=False)
     replaced = len(old.get("orders", [])) if isinstance(old, dict) else 0
     doc = {"created_by": "trader-broker", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "status": "proposed",
            "paper": bool(cfg.get("paper", True)),
            "note": "Flatten ticket. Nothing is placed until trader-risk passes it and you say yes in the chat.",
-           "source": "ticket.py flatten %s on %s" % (sym, today), "orders": [order]}
+           "source": "ticket.py flatten %s on %s" % (sym, today), "market": MARKET.code, "orders": [order]}
     write_json(a.orders, doc)
-    print("Flatten %s: %s (flat by %s New York)." % (sym, plain(order), flat_by))
+    print("Flatten %s: %s (flat by %s %s)." % (sym, plain(order), flat_by, MARKET.city))
     print("Wrote it to %s%s." % (a.orders, (" (it replaced %d earlier proposal%s)"
                                              % (replaced, "" if replaced == 1 else "s")) if replaced else ""))
     if a.qty is None:
@@ -651,8 +680,8 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
 
     def clock(p):
-        p.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
-        p.add_argument("--today", help="YYYY-MM-DD (default: today in New York)")
+        p.add_argument("--now", help="pretend it is this market time, e.g. \"2026-10-19 10:15\"")
+        p.add_argument("--today", help="YYYY-MM-DD (default: today at the market)")
 
     def common(p):
         p.add_argument("--orders", default="trader/orders.json")
@@ -687,7 +716,7 @@ def main(argv=None):
     p.add_argument("--side", required=True, choices=["buy", "sell"])
     p.add_argument("--qty", required=True)
     p.add_argument("--price", required=True)
-    p.add_argument("--date", help="YYYY-MM-DD (default: today in New York)")
+    p.add_argument("--date", help="YYYY-MM-DD (default: today at the market)")
     p.add_argument("--now")
     p.add_argument("--portfolio", default="trader/portfolio.json")
     p.add_argument("--config", default="trader/config.json")
@@ -704,14 +733,25 @@ def main(argv=None):
     p.add_argument("--state", default="trader/state/broker.json")
     clock(p)
     p.add_argument("--all", action="store_true")
+    for p in sub.choices.values():
+        p.add_argument("--market", help="exchange: %s (default: the orders file's, else "
+                       "trader/config.json \"market\", else XNYS)" % ", ".join(mk.codes()))
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
         return 1
     try:
+        odoc = None
+        opath = getattr(a, "orders", None) if a.cmd != "flatten" else None
+        if opath and os.path.exists(opath):
+            odoc = read_json(opath, "orders", required=False)
+        if a.cmd == "flatten" and os.path.exists(a.plan):
+            odoc = read_json(a.plan, "plan", required=False)
+        set_market(mk.resolve(a.market, doc=odoc if isinstance(odoc, dict) else None,
+                              config=getattr(a, "config", None) or "trader/config.json"))
         return {"show": cmd_show, "approve": cmd_approve, "decline": cmd_decline, "result": cmd_result,
                 "fill": cmd_fill, "flatten": cmd_flatten, "log": cmd_log}[a.cmd](a)
-    except TicketError as e:
+    except (TicketError, mk.MarketError) as e:
         print("ticket.py: %s" % e, file=sys.stderr)
         return 1
 
