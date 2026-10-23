@@ -125,6 +125,23 @@ and the trigger moves to 10:35 AM at 365.75 (the 10:30 bar, 7.98x).
   reset it.
 - Never call an entry early because a bar looks like it will close above.
 
+## Markets
+
+The default is US stocks (XNYS: NYSE and Nasdaq, New York time, dollars).
+Other exchanges: Xetra (XETR), Tradegate (XGAT), London (XLON), Euronext Paris
+and Amsterdam (XPAR, XAMS) and SIX (XSWX). Pick one with `--market XETR`, or
+once for every skill with `"market": "XETR"` in `trader/config.json`
+(`trader-budget/config.example.xetra.json` is a ready Xetra config). The
+market sets the clock, the holidays, the session, the currency and the Yahoo
+suffix (SAP becomes SAP.DE). Plans and orders carry their `"market"`, so the
+next skill follows it. Calendars are rules: a year not checked against the
+exchange's published calendar is flagged, and Euronext and SIX are not
+checked yet.
+
+Without `no_entries_before` and `no_entries_after` in the config the window is
+15 minutes after the open to 30 minutes before the close (09:15 to 17:00 on
+Xetra). Tradegate is read through Xetra's bars.
+
 ## What it never does
 
 It never places an order, never sizes a position, never sets the stop (that

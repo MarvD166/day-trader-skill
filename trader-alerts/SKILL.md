@@ -143,6 +143,22 @@ watched; with `add --opening-bell`, the bell rings at 9:30.
 - Never present a quote as live. Free quotes are delayed and unofficial.
 - Confirm every new rule back to the user: ticker, type, level, day.
 
+## Markets
+
+The default is US stocks (XNYS: NYSE and Nasdaq, New York time, dollars).
+Other exchanges: Xetra (XETR), Tradegate (XGAT), London (XLON), Euronext Paris
+and Amsterdam (XPAR, XAMS) and SIX (XSWX). Pick one with `--market XETR`, or
+once for every skill with `"market": "XETR"` in `trader/config.json`
+(`trader-budget/config.example.xetra.json` is a ready Xetra config). The
+market sets the clock, the holidays, the session, the currency and the Yahoo
+suffix (SAP becomes SAP.DE). Plans and orders carry their `"market"`, so the
+next skill follows it. Calendars are rules: a year not checked against the
+exchange's published calendar is flagged, and Euronext and SIX are not
+checked yet.
+
+`alerts.py clock --market XETR` shows any exchange's session. The Stooq source
+is US only; use Yahoo elsewhere.
+
 ## What it never does
 
 It never places, cancels or changes an order, never claims a quote is

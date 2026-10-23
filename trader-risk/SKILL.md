@@ -154,6 +154,23 @@ it is after the 3:30 entry cutoff: it is an exit.
 - Free Yahoo prices are unofficial and can lag; the broker's price is the one that fills, and a
   stop can fill worse than its price in a fast market.
 
+## Markets
+
+The default is US stocks (XNYS: NYSE and Nasdaq, New York time, dollars).
+Other exchanges: Xetra (XETR), Tradegate (XGAT), London (XLON), Euronext Paris
+and Amsterdam (XPAR, XAMS) and SIX (XSWX). Pick one with `--market XETR`, or
+once for every skill with `"market": "XETR"` in `trader/config.json`
+(`trader-budget/config.example.xetra.json` is a ready Xetra config). The
+market sets the clock, the holidays, the session, the currency and the Yahoo
+suffix (SAP becomes SAP.DE). Plans and orders carry their `"market"`, so the
+next skill follows it. Calendars are rules: a year not checked against the
+exchange's published calendar is flagged, and Euronext and SIX are not
+checked yet.
+
+The `*_usd` limits are read in the market's currency (EUR on Xetra). The PDT
+guard is a US rule and is off outside the US. Tickers with digits (VOW3,
+1COV) are fine outside the US.
+
 ## What it never does
 
 It never places an order, never edits an order to make it pass, never

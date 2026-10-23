@@ -44,9 +44,10 @@ def plan_rules():
 
 class Calendar(unittest.TestCase):
     def test_holidays_match_the_published_list(self):
-        self.assertEqual(sorted(alerts.NYSE_HOLIDAYS), NYSE_2026 + NYSE_2027)
-        self.assertEqual(sorted(alerts.NYSE_EARLY_CLOSE), EARLY)
-        for d in list(alerts.NYSE_HOLIDAYS) + list(alerts.NYSE_EARLY_CLOSE):
+        nyse = alerts.mk.get("XNYS")
+        self.assertEqual(sorted(nyse.holidays(2026, 2027)), NYSE_2026 + NYSE_2027)
+        self.assertEqual(sorted(nyse.early_closes(2026, 2027)), EARLY)
+        for d in list(nyse.holidays(2026, 2027)) + list(nyse.early_closes(2026, 2027)):
             self.assertLess(datetime.date.fromisoformat(d).weekday(), 5, d)
 
     def test_daylight_saving_switches(self):

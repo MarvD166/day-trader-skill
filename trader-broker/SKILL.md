@@ -191,6 +191,24 @@ card reads "Claude wants to use Place stock order" with that JSON and two
 buttons: Allow once, Deny. Allow once sends it to the paper account. The
 `why` and the plan stay in the file; they are never sent.
 
+## Markets
+
+The default is US stocks (XNYS: NYSE and Nasdaq, New York time, dollars).
+Other exchanges: Xetra (XETR), Tradegate (XGAT), London (XLON), Euronext Paris
+and Amsterdam (XPAR, XAMS) and SIX (XSWX). Pick one with `--market XETR`, or
+once for every skill with `"market": "XETR"` in `trader/config.json`
+(`trader-budget/config.example.xetra.json` is a ready Xetra config). The
+market sets the clock, the holidays, the session, the currency and the Yahoo
+suffix (SAP becomes SAP.DE). Plans and orders carry their `"market"`, so the
+next skill follows it. Calendars are rules: a year not checked against the
+exchange's published calendar is flagged, and Euronext and SIX are not
+checked yet.
+
+Alpaca lists US stocks only. An order for another market is never READY with
+`"broker": "alpaca"`: the same ticker on Alpaca can be a different security
+(SAP on the NYSE is the ADR, in dollars). Use `"broker": "ibkr"`, or place it
+yourself at your broker from the ticket.
+
 ## What it never does
 
 - Never places an order without all three gates, and never two orders on one yes.

@@ -29,7 +29,8 @@ Sources, one request each per ticker:
     price against yesterday's close:
     https://query2.finance.yahoo.com/v8/finance/chart/<TICKER>?range=1d&interval=5m
 
-Times print in New York time (ET). State: trader/state/news.json remembers
+Times print in the market's time (ET for the default XNYS; --market XETR
+prints CET or CEST). Outside the US the SEC part is off. State: trader/state/news.json remembers
 what you have seen (30 days), so an item shows once. Offline: --offline DIR
 reads yahoo-<TICKER>.xml, chart-<TICKER>.json, sec-<FORM>-<CIK>.xml and
 company_tickers.json from DIR. The tests use it.
@@ -51,6 +52,11 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import trader_markets as mk  # noqa: E402  copy of shared/trader_markets.py (scripts/sync_shared.py)
+
+MARKET = mk.get()  # XNYS unless --market or trader/config.json "market" says otherwise
 
 YAHOO = "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%s&region=US&lang=en-US"
 CHART = "https://%s.finance.yahoo.com/v8/finance/chart/%s?range=1d&interval=5m"
@@ -92,28 +98,36 @@ class NewsError(Exception):
     pass
 
 
-# ---------------------------------------------------------------- time
+# ---------------------------------------------------------------- market and time
 
-def _nth_sunday(year, month, n):
-    d = _dt.date(year, month, 1)
-    d += _dt.timedelta(days=(6 - d.weekday()) % 7)
-    return d + _dt.timedelta(weeks=n - 1)
-
-
-def eastern_offset(utc):
-    """Hours from UTC for New York: -4 in daylight time, -5 otherwise (US rule since 2007)."""
-    y = utc.year
-    start = _dt.datetime.combine(_nth_sunday(y, 3, 2), _dt.time(7, 0))   # 2:00 EST
-    end = _dt.datetime.combine(_nth_sunday(y, 11, 1), _dt.time(6, 0))    # 2:00 EDT
-    naive = utc.replace(tzinfo=None)
-    return -4 if start <= naive < end else -5
+def set_market(m):
+    """Switch the exchange this run uses (a trader_markets.Market or a code like "XETR")."""
+    global MARKET
+    m = m if isinstance(m, mk.Market) else mk.get(m)
+    MARKET = m
+    return m
 
 
-def to_eastern(utc):
-    """Aware or naive UTC -> naive New York wall-clock time."""
-    if utc.tzinfo is not None:
-        utc = utc.astimezone(_dt.timezone.utc)
-    return utc.replace(tzinfo=None) + _dt.timedelta(hours=eastern_offset(utc))
+def utc_offset(utc):
+    return MARKET.offset(utc)
+
+
+def to_local(utc):
+    """naive UTC -> naive wall clock at the market."""
+    return MARKET.to_local(utc)
+
+
+def local_to_utc(local):
+    return MARKET.to_utc(local)
+
+
+# the US-only names, kept for older callers
+eastern_offset, to_eastern, eastern_to_utc = utc_offset, to_local, local_to_utc
+
+
+def tz(utc):
+    """ET, CET or CEST, ... at that instant."""
+    return MARKET.tz_label(utc)
 
 
 # ---------------------------------------------------------------- inputs
@@ -192,7 +206,8 @@ class Fetcher(object):
 
 
 def yahoo_symbol(ticker):
-    return ticker.upper().replace(".", "-")
+    """SAP -> SAP.DE on Xetra, BRK.B -> BRK-B in the US."""
+    return MARKET.yahoo(ticker)
 
 
 def cik_map(fetcher, state):
@@ -300,8 +315,9 @@ def parse_chart(data, ticker):
     if not price or not prev:
         raise NewsError("chart for %s has no price" % ticker)
     when = meta.get("regularMarketTime")
-    return {"ticker": ticker, "price": round(float(price), 2), "prev_close": round(float(prev), 2),
-            "pct": round((float(price) / float(prev) - 1) * 100, 2),
+    price, prev = MARKET.price(float(price)), MARKET.price(float(prev))   # pence -> pounds on the LSE
+    return {"ticker": ticker, "price": round(price, 2), "prev_close": round(prev, 2),
+            "pct": round((price / prev - 1) * 100, 2),
             "time": _dt.datetime.fromtimestamp(when, _dt.timezone.utc) if when else None}
 
 
@@ -439,7 +455,7 @@ def render_moves(moves, move_pct=MOVE_PCT):
     out = []
     for m in moves:
         flag = "MOVING" if abs(m["pct"]) >= move_pct else ""
-        when = (" at %s ET" % to_eastern(m["time"]).strftime("%H:%M")) if m.get("time") else ""
+        when = (" at %s %s" % (to_local(m["time"]).strftime("%H:%M"), tz(m["time"]))) if m.get("time") else ""
         out.append("%-6s %s %+.2f%% vs yesterday's close %s%s  %s" % (
             m["ticker"], "{:,.2f}".format(m["price"]), m["pct"], "{:,.2f}".format(m["prev_close"]),
             when, flag))
@@ -453,7 +469,8 @@ def render(items, errors, now, moves=None, move_pct=MOVE_PCT):
     if not items:
         out.append("Nothing new.")
     for it in items:
-        when = to_eastern(it["time"]).strftime("%Y-%m-%d %H:%M ET") if it["time"] else "time unknown"
+        when = ("%s %s" % (to_local(it["time"]).strftime("%Y-%m-%d %H:%M"), tz(it["time"]))) if it["time"] \
+            else "time unknown"
         mark = "!" if it.get("important") else " "
         who = ",".join(it["touches"]) or it["ticker"]
         out.append("%s %s  %-11s %-13s %s" % (mark, when, who, it["source"], it["title"]))
@@ -465,7 +482,7 @@ def render(items, errors, now, moves=None, move_pct=MOVE_PCT):
     for e in errors:
         out.append("note: %s" % e)
     out.append("Checked %s. Headlines are leads, not facts; open the story before acting. "
-               "Not financial advice." % to_eastern(now).strftime("%Y-%m-%d %H:%M ET"))
+               "Not financial advice." % ("%s %s" % (to_local(now).strftime("%Y-%m-%d %H:%M"), tz(now))))
     return "\n".join(out) + "\n"
 
 
@@ -496,8 +513,15 @@ def main(argv=None):
     ap.add_argument("--offline", metavar="DIR")
     ap.add_argument("--now", help="ISO time, for reproducible runs")
     ap.add_argument("--dry-run", action="store_true", help="do not update the state file")
+    ap.add_argument("--market", help="exchange: %s (default: trader/config.json \"market\", else XNYS). "
+                    "SEC filings are US only" % ", ".join(mk.codes()))
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
+    try:
+        set_market(mk.resolve(args.market, config=args.config))
+    except mk.MarketError as e:
+        print("news: %s" % e, file=sys.stderr)
+        return 2
 
     if args.tickers:
         watch = {t.upper(): None for t in args.tickers}
@@ -514,6 +538,10 @@ def main(argv=None):
     errors = []
     ua = sec_user_agent(args.user_agent, args.config)
     sec = not args.no_sec
+    if sec and MARKET.code != "XNYS":
+        errors.append("SEC filings skipped: they cover US filers, and a %s ticker can name a different US "
+                      "company. Headlines still run" % MARKET.short)
+        sec = False
     if sec and not ua and not args.offline:
         errors.append("SEC filings skipped: set sec_user_agent in trader/config.json or "
                       "SEC_USER_AGENT (\"Your Name you@example.com\") to include them")
